@@ -134,19 +134,22 @@ def get_retriever(spec: str, corpus: list[str]):
 # --------------------------------------------------------------------------
 # Evaluation and use
 # --------------------------------------------------------------------------
-def recall_at_k(ranked: np.ndarray, k: int) -> float:
+def recall_at_k(ranked: np.ndarray, k: int, gold: np.ndarray | None = None) -> float:
     """Fraction of questions whose own document appears in the top k.
 
-    Document i is correct for question i by construction, so this needs no
-    relevance judgements.
+    `gold[i]` is the corpus position of question i's own passage. It defaults to
+    arange, which is right only when the queries ARE the corpus. Once you
+    evaluate a sample of questions against a full corpus -- which you should,
+    since shrinking the corpus to the sample makes retrieval trivially easy --
+    the positions differ and must be passed in.
     """
-    gold = np.arange(len(ranked))[:, None]
+    gold = (np.arange(len(ranked)) if gold is None else np.asarray(gold))[:, None]
     return float((ranked[:, :k] == gold).any(axis=1).mean())
 
 
-def mrr(ranked: np.ndarray) -> float:
+def mrr(ranked: np.ndarray, gold: np.ndarray | None = None) -> float:
     """Mean reciprocal rank of the correct document."""
-    gold = np.arange(len(ranked))[:, None]
+    gold = (np.arange(len(ranked)) if gold is None else np.asarray(gold))[:, None]
     hits = ranked == gold
     total = 0.0
     for row in range(len(ranked)):

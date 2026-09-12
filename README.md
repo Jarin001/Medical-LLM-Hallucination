@@ -1,4 +1,7 @@
-# MedHallu on a laptop
+# medhallu-mitigation
+
+Does RAG, CoT, or both improve hallucination *detection* on MedHallu?
+Baselines come from the paper; we add the mitigations and compare.
 
 A runnable, GPU-free version of **MedHallu: A Comprehensive Benchmark for
 Detecting Medical Hallucinations in Large Language Models**
@@ -177,6 +180,57 @@ Walks one question at a time through generate → quality vote → entailment ch
 With `--backend ollama:...` it generates genuinely new hallucinated answers and
 runs a real judge vote — the honest small-scale version.
 
+### 5. `rag.py` + `experiment.py` — RAG and CoT (Li et al.)
+
+Built on *"Mitigating Hallucination in LLMs: An Application-Oriented Survey on
+RAG, Reasoning, and Agentic Systems"* (Li et al.), whose central claim is:
+
+> **RAG** fixes **knowledge-based** hallucinations (wrong or missing facts).
+> **CoT** fixes **logic-based** ones (sound facts, broken reasoning).
+
+MedHallu's categories map onto that split — see `data.HALLUCINATION_TYPE`.
+**That mapping is ours, not the paper's, and it is arguable**: we call
+"Misinterpretation of #Question#" logic-based because the failure is answering a
+different question than the one asked. Expect to defend it.
+
+Retrieval quality first:
+
+```bash
+.venv/Scripts/python.exe src/rag.py --retriever dense --k 3 --corpus-extra pqa_artificial
+```
+
+On the 10,000-document corpus: TF-IDF gets recall@1 0.858 / recall@3 0.933;
+dense MiniLM gets **0.932 / 0.975**. **Always pass `--corpus-extra`** — without
+distractors retrieval is near-perfect, RAG collapses onto oracle, and the
+experiment measures nothing.
+
+Then the 2×2:
+
+```bash
+.venv/Scripts/python.exe src/experiment.py --backend ollama:qwen2.5:1.5b-instruct --limit 300
+```
+
+| | knowledge slice | logic slice |
+|---|---|---|
+| baseline | low | low |
+| + RAG | **HIGH** | low |
+| + CoT | low | **HIGH** |
+| + both | **HIGH** | **HIGH** |
+
+A clean diagonal supports the taxonomy. If RAG lifts both, or neither lifts its
+own slice, the taxonomy doesn't transfer to medical text — equally worth
+reporting, and nobody has checked.
+
+`detect.py` also takes `--cot` and `--self-consistency N` (Wang et al. majority
+voting) individually.
+
+**Two things that will bite you.** CoT replies are full of digits before the
+verdict ("step 1", "type 2 diabetes"), so the parser reads the `FINAL:` line or
+the *last* digit — taking the first, which is right for terse replies, mis-scores
+3 of 7 realistic CoT outputs. And the retrieval corpus is built from the full
+config, never the `--limit` sample; retrieving 300 questions from a 300-document
+corpus is trivially easy and inflates recall from 0.95 to 0.99.
+
 ## Suggested order
 
 1. `data.py` — see the data, confirm Figure 3.
@@ -186,6 +240,8 @@ runs a real judge vote — the honest small-scale version.
 5. `detect.py --backend ollama:... --limit 100 --both` — a real judge; expect
    the knowledge gap the paper reports.
 6. `semantics.py` — the analysis, and the reversal.
+7. `rag.py` — check retrieval quality before trusting any RAG number.
+8. `experiment.py` — the RAG × CoT 2×2 against the taxonomy.
 
 ## What this is not
 

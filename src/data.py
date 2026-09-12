@@ -55,12 +55,37 @@ def to_detection_pairs(df: pd.DataFrame) -> pd.DataFrame:
             "label": label,
             "difficulty": df[COL_DIFFICULTY],
             "category": df[COL_CATEGORY],
+            "hallu_type": df[COL_CATEGORY].map(hallucination_type),
             "source_row": df.index,
         })
         return out
 
     pairs = pd.concat([block(COL_HALLU, 1), block(COL_TRUTH, 0)], ignore_index=True)
     return pairs.sort_values(["source_row", "label"]).reset_index(drop=True)
+
+
+# Li et al., "Mitigating Hallucination in LLMs", split hallucinations into
+#   knowledge-based  wrong or missing facts         -> RAG should help
+#   logic-based      sound facts, broken reasoning  -> CoT should help
+#
+# They never apply this to MedHallu. The mapping below is OURS and it is
+# arguable: "Misinterpretation of #Question#" is called logic-based because the
+# failure is answering a different question than the one asked -- a
+# comprehension failure, not a factual one. The other three invent, distort or
+# withhold facts, so they are knowledge-based.
+#
+# Present this as an interpretation, not as the paper's. It is the hinge of the
+# entire RAG-vs-CoT experiment and someone will push on it.
+HALLUCINATION_TYPE = {
+    "Misinterpretation of #Question#": "logic",
+    "Incomplete Information": "knowledge",
+    "Mechanism and Pathway Misattribution": "knowledge",
+    "Methodological and Evidence Fabrication": "knowledge",
+}
+
+
+def hallucination_type(category) -> str:
+    return HALLUCINATION_TYPE.get(str(category), "unknown")
 
 
 def _flatten_knowledge(value) -> str:

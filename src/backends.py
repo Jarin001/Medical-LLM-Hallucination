@@ -131,7 +131,7 @@ class ConstantBackend:
 
     name = "constant-always-hallucinated"
 
-    def judge(self, question, answer, knowledge=None, allow_not_sure=False):
+    def judge(self, question, answer, knowledge=None, allow_not_sure=False, cot=False):
         return 1
 
 
@@ -155,7 +155,8 @@ class LexicalBackend:
     def _tokens(self, text):
         return {w for w in re.findall(r"[a-z]{4,}", str(text).lower()) if w not in self.STOP}
 
-    def judge(self, question, answer, knowledge=None, allow_not_sure=False):
+    def judge(self, question, answer, knowledge=None, allow_not_sure=False, cot=False):
+        # cot is meaningless without a model; accepted so the interface matches.
         reference = self._tokens(knowledge) if knowledge else self._tokens(question)
         answer_tokens = self._tokens(answer)
         if not answer_tokens:
@@ -175,20 +176,21 @@ class OllamaBackend:
         self.timeout = timeout
         self.name = f"ollama/{model}"
 
-    def judge(self, question, answer, knowledge=None, allow_not_sure=False):
+    def judge(self, question, answer, knowledge=None, allow_not_sure=False, cot=False):
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": build_system_prompt(allow_not_sure)},
+                {"role": "system", "content": build_system_prompt(allow_not_sure, cot)},
                 {"role": "user", "content": build_user_prompt(
-                    question, answer, knowledge, allow_not_sure)},
+                    question, answer, knowledge, allow_not_sure, cot)},
             ],
             "stream": False,
-            "options": {"temperature": self.temperature, "num_predict": 8},
+            "options": {"temperature": self.temperature,
+                        "num_predict": 400 if cot else 8},
         }
         r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
         r.raise_for_status()
-        return parse_judgement(r.json()["message"]["content"], allow_not_sure)
+        return parse_judgement(r.json()["message"]["content"], allow_not_sure, cot)
 
 
 class AnthropicBackend:
@@ -199,17 +201,17 @@ class AnthropicBackend:
         self.temperature = temperature
         self.name = f"anthropic/{model}"
 
-    def judge(self, question, answer, knowledge=None, allow_not_sure=False):
+    def judge(self, question, answer, knowledge=None, allow_not_sure=False, cot=False):
         resp = self.client.messages.create(
             model=self.model,
-            max_tokens=8,
+            max_tokens=600 if cot else 8,
             temperature=self.temperature,
-            system=build_system_prompt(allow_not_sure),
+            system=build_system_prompt(allow_not_sure, cot),
             messages=[{"role": "user", "content": build_user_prompt(
-                question, answer, knowledge, allow_not_sure)}],
+                question, answer, knowledge, allow_not_sure, cot)}],
         )
         text = "".join(b.text for b in resp.content if b.type == "text")
-        return parse_judgement(text, allow_not_sure)
+        return parse_judgement(text, allow_not_sure, cot)
 
 
 class OpenAIBackend:
@@ -220,18 +222,45 @@ class OpenAIBackend:
         self.temperature = temperature
         self.name = f"openai/{model}"
 
-    def judge(self, question, answer, knowledge=None, allow_not_sure=False):
+    def judge(self, question, answer, knowledge=None, allow_not_sure=False, cot=False):
         resp = self.client.chat.completions.create(
             model=self.model,
-            max_tokens=8,
+            max_tokens=600 if cot else 8,
             temperature=self.temperature,
             messages=[
-                {"role": "system", "content": build_system_prompt(allow_not_sure)},
+                {"role": "system", "content": build_system_prompt(allow_not_sure, cot)},
                 {"role": "user", "content": build_user_prompt(
-                    question, answer, knowledge, allow_not_sure)},
+                    question, answer, knowledge, allow_not_sure, cot)},
             ],
         )
-        return parse_judgement(resp.choices[0].message.content, allow_not_sure)
+        return parse_judgement(resp.choices[0].message.content, allow_not_sure, cot)
+
+
+class SelfConsistency:
+    """Wrap any backend: sample it n times, majority-vote the verdicts.
+
+    Self-consistency (Wang et al. 2023), which Li et al. treat as the standard
+    companion to CoT in SS V. The premise is that a single greedy chain can go
+    wrong in one step and never recover, whereas independent chains tend to
+    agree when the model actually knows and scatter when it does not.
+
+    It only does anything at non-zero temperature -- identical samples cannot
+    disagree -- so the temperature is raised here even though the rest of the
+    benchmark runs near-deterministic. Cost is n forward passes per judgement.
+    """
+
+    def __init__(self, backend, n: int = 5, temperature: float = 0.7):
+        self.backend = backend
+        self.n = n
+        self.name = f"{backend.name}+sc{n}"
+        # Raise temperature so the chains actually differ.
+        if hasattr(backend, "temperature"):
+            backend.temperature = temperature
+
+    def judge(self, question, answer, knowledge=None, allow_not_sure=False, cot=False):
+        votes = [self.backend.judge(question, answer, knowledge, allow_not_sure, cot)
+                 for _ in range(self.n)]
+        return majority_vote(votes, allow_not_sure)
 
 
 def get_backend(spec: str):

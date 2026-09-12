@@ -62,7 +62,7 @@ def score(preds, labels, allow_not_sure):
     }
 
 
-def evaluate(backend, pairs, knowledge_col, allow_not_sure, mode_label):
+def evaluate(backend, pairs, knowledge_col, allow_not_sure, mode_label, cot=False):
     preds = []
     desc = f"{backend.name} | {mode_label} | not_sure={allow_not_sure}"
     knowledge = pairs[knowledge_col] if knowledge_col else None
@@ -73,6 +73,7 @@ def evaluate(backend, pairs, knowledge_col, allow_not_sure, mode_label):
             answer=row.answer,
             knowledge=knowledge.iat[i] if knowledge is not None else None,
             allow_not_sure=allow_not_sure,
+            cot=cot,
         ))
 
     out = pairs.copy()
@@ -86,25 +87,42 @@ def evaluate(backend, pairs, knowledge_col, allow_not_sure, mode_label):
     for level in ("easy", "medium", "hard"):
         slice_ = out[out["difficulty"] == level]
         report[level] = score(slice_["pred"], slice_["label"], allow_not_sure)
+
+    # Li et al.'s taxonomy: RAG is predicted to help the knowledge slice, CoT
+    # the logic slice. Both slices stay balanced because hallu_type, like
+    # difficulty, is a property of the source row.
+    for htype in ("knowledge", "logic"):
+        slice_ = out[out["hallu_type"] == htype]
+        report[f"type:{htype}"] = (score(slice_["pred"], slice_["label"], allow_not_sure)
+                                   if len(slice_) else None)
     return report, out
 
 
 def print_report(title, report):
     print(f"\n{title}")
-    header = f"  {'slice':<9}{'n':>6}{'P':>8}{'R':>8}{'F1':>8}{'resp%':>8}"
+    header = f"  {'slice':<15}{'n':>6}{'P':>8}{'R':>8}{'F1':>8}{'resp%':>8}"
     print(header)
     print("  " + "-" * (len(header) - 2))
-    for key in ("overall", "easy", "medium", "hard"):
-        m = report[key]
-        print(f"  {key:<9}{m['n']:>6}{m['precision']:>8}{m['recall']:>8}"
+    for key in ("overall", "easy", "medium", "hard", "type:knowledge", "type:logic"):
+        m = report.get(key)
+        if m is None:
+            continue
+        print(f"  {key:<15}{m['n']:>6}{m['precision']:>8}{m['recall']:>8}"
               f"{m['f1']:>8}{m['response_pct']:>8}")
 
 
-def attach_rag(df, pairs, args):
-    """Add a `knowledge_rag` column: the top-k passages a retriever fetched."""
+def attach_rag(df, pairs, args, full_df=None):
+    """Add a `knowledge_rag` column: the top-k passages a retriever fetched.
+
+    The corpus is built from the FULL config, never from the sampled subset.
+    Retrieving 300 questions out of a 300-document corpus is trivially easy and
+    would flatter the results; the retriever should face the whole collection
+    however many queries you score.
+    """
     import rag  # imported lazily so non-RAG runs need no retrieval deps
 
-    corpus = rag.build_corpus(df)
+    full = df if full_df is None else full_df
+    corpus = rag.build_corpus(full)
     n_gold = len(corpus)
     if args.corpus_extra:
         extra = rag.build_corpus(data.load(args.corpus_extra))
@@ -117,14 +135,17 @@ def attach_rag(df, pairs, args):
 
     retriever = rag.get_retriever(args.retriever, corpus)
     passages, ranked = rag.retrieve_knowledge(df, retriever, args.k, corpus)
-    print(f"rag retriever: {retriever.name}   k={args.k}   "
-          f"recall@{args.k}={rag.recall_at_k(ranked, args.k):.3f}")
+
+    # Where each sampled question's own passage sits in the full corpus.
+    gold = df["orig_index"].to_numpy() if "orig_index" in df.columns else None
+    recall = rag.recall_at_k(ranked, args.k, gold)
+    print(f"rag retriever: {retriever.name}   k={args.k}   recall@{args.k}={recall:.3f}")
 
     # pairs carry source_row, so the same retrieval serves both of a row's
     # examples without retrieving twice.
     by_row = dict(enumerate(passages))
     pairs["knowledge_rag"] = pairs["source_row"].map(by_row)
-    return rag.recall_at_k(ranked, args.k)
+    return recall
 
 
 def main():
@@ -139,6 +160,11 @@ def main():
     ap.add_argument("--knowledge-mode", default="none,oracle",
                     help="comma list of: none, oracle, rag")
     ap.add_argument("--not-sure", action="store_true", help="offer the abstain option")
+    ap.add_argument("--cot", action="store_true",
+                    help="chain-of-thought prompting (Li et al. SS V)")
+    ap.add_argument("--self-consistency", type=int, default=0, metavar="N",
+                    help="sample the judge N times and majority-vote; needs --cot to be "
+                         "meaningful, and costs N forward passes per judgement")
     ap.add_argument("--retriever", default="tfidf", help="rag only: tfidf | dense[:model]")
     ap.add_argument("--k", type=int, default=3, help="rag only: passages to retrieve")
     ap.add_argument("--corpus-extra", default=None,
@@ -150,30 +176,38 @@ def main():
     if bad:
         raise SystemExit(f"unknown knowledge mode(s) {bad}; choose from {list(MODES)}")
 
-    df = data.load(args.config)
+    full_df = data.load(args.config)
+    df = full_df
     if args.limit and args.limit < len(df):
         df = df.sample(n=args.limit, random_state=args.seed)
-    df = df.reset_index(drop=True)
+    df = df.reset_index(names="orig_index") if "orig_index" not in df.columns         else df.reset_index(drop=True)
     pairs = data.to_detection_pairs(df)
 
     backend = get_backend(args.backend)
-    print(f"backend : {backend.name}")
+    if args.self_consistency > 1:
+        from backends import SelfConsistency
+        backend = SelfConsistency(backend, args.self_consistency)
+    if args.cot and args.backend in ("constant", "lexical"):
+        print("! --cot has no effect on a non-LLM backend; it is accepted so the "
+              "plumbing can be tested, but the numbers will be identical.")
+    print(f"backend : {backend.name}   cot={args.cot}")
     print(f"data    : {args.config}, {len(df)} rows -> {len(pairs)} judgements per pass")
 
     recall = None
     if "rag" in modes:
-        recall = attach_rag(df, pairs, args)
+        recall = attach_rag(df, pairs, args, full_df)
 
     column = {"none": None, "oracle": "knowledge", "rag": "knowledge_rag"}
     results = {}
     for mode in modes:
         started = time.time()
-        report, raw = evaluate(backend, pairs, column[mode], args.not_sure, mode)
+        report, raw = evaluate(backend, pairs, column[mode], args.not_sure, mode, args.cot)
         elapsed = time.time() - started
         results[mode] = report
         print_report(f"{mode}  ({elapsed:.1f}s, {elapsed / max(len(pairs), 1):.2f}s/judgement)",
                      report)
-        raw.to_csv(RESULTS_DIR / f"raw_{_slug(backend.name)}_{mode}.csv", index=False)
+        raw.to_csv(RESULTS_DIR / f"raw_{_slug(backend.name)}"
+                   f"{'_cot' if args.cot else ''}_{mode}.csv", index=False)
 
     if len(modes) > 1:
         print(f"\n  {'condition':<10}{'F1':>8}{'vs none':>10}")
@@ -199,9 +233,12 @@ def main():
                       "context. Use a real judge.")
         print("\n  paper: +0.251 F1 from oracle knowledge, averaged over general LLMs")
 
-    summary = RESULTS_DIR / f"summary_{_slug(backend.name)}.json"
+    tag = _slug(backend.name) + ("_cot" if args.cot else "")
+    summary = RESULTS_DIR / f"summary_{tag}.json"
     payload = {"backend": backend.name, "config": args.config, "rows": len(df),
-               "not_sure": args.not_sure, "modes": modes, "results": results}
+               "not_sure": args.not_sure, "cot": args.cot,
+               "self_consistency": args.self_consistency,
+               "modes": modes, "results": results}
     if recall is not None:
         payload["rag"] = {"retriever": args.retriever, "k": args.k,
                           "corpus_extra": args.corpus_extra, "recall_at_k": recall}
