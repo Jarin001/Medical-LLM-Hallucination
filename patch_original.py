@@ -96,12 +96,15 @@ CSV_PATH = "results.csv"
 #   knowledge_source: None = no knowledge, "oracle" = the row's own context,
 #                     "rag" = top-k retrieved passages
 CONDITIONS = [
-    ("baseline", None,     False),
-    ("oracle",   "oracle", False),   # the paper's "with knowledge"
-    ("rag",      "rag",    False),
-    ("cot",      None,     True),
-    ("rag+cot",  "rag",    True),
+    ("baseline", None,     False),   # 1. detection as the paper measures it
+    ("oracle",   "oracle", False),   # 2. the paper's "with knowledge" ceiling
+    ("rag",      "rag",    False),   # 3. real retrieval, external corpus
+    ("cot",      None,     True),    # 4. reasoning, no extra knowledge
+    ("rag+cot",  "rag",    True),    # 5. both
 ]
+# Optional diagnostic, not a headline result. Add this row to split rag's
+# shortfall into distractor cost vs missing-passage cost:
+#     ("oracle+rag", "oracle+rag", False),
 
 # Ollama serves an OpenAI-compatible endpoint, so these defaults run the
 # models on THIS machine, free, with no account and no key. Ollama ignores the

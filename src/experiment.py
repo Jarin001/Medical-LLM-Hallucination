@@ -38,12 +38,17 @@ from backends import get_backend
 from config import CONFIGS, RESULTS_DIR
 
 CONDITIONS = [
-    ("baseline", "none", False),
-    ("rag", "rag", False),
-    ("cot", "none", True),
-    ("rag+cot", "rag", True),
-    ("oracle", "oracle", False),  # ceiling: perfect retrieval, no reasoning
+    ("baseline",   "none",   False),   # 1. detection as the paper measures it
+    ("oracle",     "oracle", False),   # 2. the paper's with-knowledge ceiling
+    ("rag",        "rag",    False),   # 3. real retrieval
+    ("cot",        "none",   True),    # 4. reasoning, no extra knowledge
+    ("rag+cot",    "rag",    True),    # 5. both
 ]
+
+# Not part of the headline table. `oracle+rag` answers a different question --
+# WHY rag trails oracle -- by keeping the correct passage and adding distractors
+# on top. Enable with --diagnose.
+DIAGNOSTIC = ("oracle+rag", "oracle+rag", False)
 
 
 def main():
@@ -63,6 +68,9 @@ def main():
                     help="external knowledge source: textbooks | statpearls | "
                          "pubmed | wikipedia, or 'self' for the ablation")
     ap.add_argument("--max-docs", type=int, default=0)
+    ap.add_argument("--diagnose", action="store_true",
+                    help="also run oracle+rag, which splits rag's shortfall into "
+                         "distractor cost vs missing-passage cost")
     args = ap.parse_args()
 
     full_df = data.load(args.config)
@@ -88,8 +96,9 @@ def main():
 
     column = {"none": None, "oracle": "knowledge", "rag": "knowledge_rag",
               "oracle+rag": "knowledge_oracle_rag"}
+    conditions = CONDITIONS + ([DIAGNOSTIC] if args.diagnose else [])
     results = {}
-    for label, mode, cot in CONDITIONS:
+    for label, mode, cot in conditions:
         started = time.time()
         report, raw = detect.evaluate(backend, pairs, column[mode], args.not_sure, label, cot)
         results[label] = report
@@ -102,7 +111,7 @@ def main():
 
     print(f"\n{'condition':<12}{'overall':>10}{'knowledge':>12}{'logic':>10}")
     print("-" * 44)
-    for label, _, _ in CONDITIONS:
+    for label, _, _ in conditions:
         print(f"{label:<12}{f1(label, 'overall'):>10.3f}"
               f"{f1(label, 'type:knowledge'):>12.3f}{f1(label, 'type:logic'):>10.3f}")
 

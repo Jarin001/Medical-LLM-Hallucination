@@ -1,253 +1,258 @@
 # medhallu-mitigation
 
-Does RAG, CoT, or both improve hallucination *detection* on MedHallu?
-Baselines come from the paper; we add the mitigations and compare.
+**Does RAG, Chain-of-Thought, or both improve hallucination *detection* in
+medical QA?**
 
-A runnable, GPU-free version of **MedHallu: A Comprehensive Benchmark for
-Detecting Medical Hallucinations in Large Language Models**
-([arXiv:2502.14302](https://arxiv.org/abs/2502.14302),
-[official repo](https://github.com/MedHallu/MedHallu)).
+MedHallu benchmarks how well LLMs spot fabricated medical answers, and finds
+they are poor at it. We add the mitigation techniques from Li et al. and measure
+whether they help.
 
-## Can the original be run on this laptop?
+Baselines come from the MedHallu paper, so we do not re-run 14 models. We add
+conditions and compare against published numbers.
 
-**The official repo: no.** Not a configuration problem — a hardware one.
+---
 
-| | Paper / official repo | This laptop |
+## The question
+
+MedHallu ([arXiv:2502.14302](https://arxiv.org/abs/2502.14302)) reports two
+settings per model:
+
+| Setting | What the judge sees | Qwen2.5-7B F1 |
 |---|---|---|
-| GPU | 4× NVIDIA RTX A6000, 48 GB VRAM each (192 GB total) | Intel Iris Xe integrated, no CUDA |
-| Inference engine | vLLM 0.6.3 with `tensor_parallel_size=4` | vLLM needs a CUDA GPU; will not install usefully |
-| Generator model | Qwen2.5-14B (~28 GB in fp16) | 15.7 GB system RAM total |
-| Judge models | 14 models, 7B–14B each | — |
-| Dataset generation | 26.5 GPU-hours | — |
-| Free disk on C: | — | 3.8 GB |
+| Without knowledge | question + answer | 0.553 |
+| With knowledge | question + answer + **the exact source abstract** | 0.839 |
 
-Both entry points in the official repo (`Dataset Generation/generation.py`,
-`Detection/detection_vllm_notsurecase.py`) import `vllm` at module level and
-load 7B+ models, so neither will start here.
+That second setting is **oracle retrieval** — the correct passage, handed over,
+guaranteed. No deployed system has it. Yet it is the paper's largest single
+effect: **+0.286 F1**.
 
-**What is genuinely reachable:** the authors published the finished dataset, so
-the *benchmark* half of the paper does not need their hardware at all.
+So the interesting number is missing. What happens with *realistic* knowledge —
+retrieved from an outside corpus, sometimes wrong, always noisy?
 
-- The 10,000-row dataset is public on the Hub as
-  [`UTAustin-AIHealth/MedHallu`](https://huggingface.co/datasets/UTAustin-AIHealth/MedHallu),
-  11 MB of parquet, no token required. **No GPU, no regeneration.**
-- Detection can be scored against any judge you can reach — a small quantised
-  model on CPU, or an API model standing in for the paper's GPT-4o row.
-- The semantic analysis (paper §5.3) is pure numerical work on released text.
-  Runs on CPU in seconds.
+Li et al. (*Mitigating Hallucination in LLMs: An Application-Oriented Survey on
+RAG, Reasoning, and Agentic Systems*) argue two mechanisms fix two different
+failures:
 
-Only *dataset generation* is truly out of reach, and `generate_demo.py` walks
-through that pipeline step by step so the mechanism is still legible.
+- **RAG** fixes **knowledge-based** hallucinations — the model lacked the facts
+- **CoT** fixes **logic-based** hallucinations — it had them and reasoned badly
 
-## Setup
+Neither paper tests that split on medical hallucination *detection*. That is
+what this project does.
 
-Already done if you are reading this in place; the venv lives at `.venv`.
-From scratch:
+---
 
-```bash
-python -m venv .venv && .venv/Scripts/python.exe -m pip install pandas pyarrow scikit-learn scipy requests tqdm
+## Five results
+
+| # | Condition | What the judge gets |
+|---|---|---|
+| 1 | `baseline` | Question + answer only. Detection as the paper measures it. |
+| 2 | `oracle` | ...plus the exact source abstract. The paper's ceiling. |
+| 3 | `rag` | ...plus top-k passages retrieved from **medical textbooks** |
+| 4 | `cot` | No extra text — the model is told to reason step by step first |
+| 5 | `rag+cot` | Retrieved passages **and** step-by-step reasoning |
+
+Rows 1 and 2 come from the MedHallu paper, so they double as a check that the
+setup is sound. Rows 3–5 are the contribution.
+
+### Optional diagnostic: `oracle+rag`
+
+Not a headline result — it answers a different question. `rag` trails `oracle`
+for two reasons that cannot otherwise be separated: retrieval sometimes
+**misses** the right passage, and it **adds distractors** even when it hits.
+`oracle+rag` keeps the correct passage and adds the retrieved ones on top, which
+splits the shortfall:
+
+```
+oracle − (oracle+rag)  =  what distractors alone cost
+(oracle+rag) − rag     =  what missing the right passage costs
 ```
 
-Everything lives on `E:` on purpose — `config.py` also repoints `HF_HOME`, since
-the default model cache under `%USERPROFILE%` would land on a nearly-full `C:`.
+If distractors dominate, the fix is a reranker. If missing passages dominate,
+the fix is a bigger corpus. Opposite engineering decisions. Enable with
+`--diagnose`.
 
-For the embedding measure (installed and verified here — torch 2.13.0+cpu,
-sentence-transformers 6.0.0). CPU-only wheels, no CUDA:
+---
 
-```bash
-.venv/Scripts/python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+## RAG uses an external corpus, not MedHallu's own answers
+
+**This matters and is easy to get wrong.** An early version of this project
+retrieved from MedHallu's own `Knowledge` column. That is not RAG — the correct
+passage is present by construction, so the task reduces to ranking it first.
+
+RAG now searches **MedRAG/textbooks**: 125,847 snippets from 18 medical
+textbooks (Xiong et al.). 101 MB, ungated, cached after first download.
+`statpearls`, `pubmed` and `wikipedia` are also wired up; PubMed is 23.9M
+passages and needs more than a laptop.
+
+It is a genuinely hard test. MedHallu questions come from PubMed research
+abstracts; a textbook may not contain the specific finding at all. Verbatim from
+a run:
+
+> **Question:** Do mitochondria play a role in remodelling lace plant leaves
+> during programmed cell death?
+>
+> **Retrieved:** Histology_Ross on programmed cell death · Pathology_Robbins on
+> mitochondrial roles · Gynecology_Novak on apoptosis
+
+Topically adjacent, specifically useless — none mention lace plants. **Expect
+RAG to fall short of oracle. That gap is the result.**
+
+`--corpus self` reproduces the old behaviour as a labelled ablation. Do not
+report it as a RAG result.
+
+---
+
+## Repository layout
+
+```
+patch_original.py            Patches the official MedHallu repo (see below)
+compare_to_paper.py          Joins your results against MedHallu Table 2
+STEP1_VALIDATE_BASELINE.md   Reproduce the paper's numbers first
+STEP2_ADD_MITIGATIONS.md     Then add RAG / CoT
+
+src/
+  config.py            Paths; redirects model caches off the system drive
+  data.py              Dataset download; the knowledge/logic taxonomy mapping
+  make_original_csv.py Converts the HF dataset into the columns MedHallu expects
+  backends.py          Judges: constant, lexical, ollama, anthropic, openai,
+                       plus CoT prompting and self-consistency voting
+  rag.py               External corpora, TF-IDF and dense retrieval, recall@k
+  detect.py            The benchmark: metrics by difficulty and hallucination type
+  experiment.py        The RAG x CoT grid in one run
+  semantics.py         Similarity analysis of the dataset itself
+  generate_demo.py     Walks the dataset-generation pipeline step by step
 ```
 
-```bash
-.venv/Scripts/python.exe -m pip install sentence-transformers
-```
+---
 
-Optional, for a real local LLM judge — install [Ollama](https://ollama.com), then:
+## Two ways to run it
 
-```bash
-ollama pull qwen2.5:1.5b-instruct
-```
+### A. Patch the official MedHallu repo — use this for reportable results
 
-## The four scripts
+The official code cannot run on a laptop and cannot read its own published
+dataset. `patch_original.py` fixes seven things:
 
-### 1. `data.py` — get the dataset
-
-```bash
-.venv/Scripts/python.exe src/data.py --config pqa_labeled
-```
-
-Fetches and caches the parquet, prints the distributions. Reproduces the paper's
-Figure 3: `hard` 408 > `medium` 318 > `easy` 274 on the labeled split, and
-question-misinterpretation dominating the categories (752/1000).
-
-`to_detection_pairs()` is the important function: each source row becomes **two**
-labelled examples — the hallucinated answer (label 1) and the ground truth
-(label 0). That is what makes the benchmark balanced, and it matters for
-reading the scores below.
-
-### 2. `detect.py` — the benchmark (paper Tables 2 and 4)
-
-```bash
-.venv/Scripts/python.exe src/detect.py --backend constant --limit 300
-```
-
-```bash
-.venv/Scripts/python.exe src/detect.py --backend ollama:qwen2.5:1.5b-instruct --limit 100 --both
-```
-
-Reports precision / recall / F1 overall and split by difficulty, with and
-without the supporting knowledge. Backends: `constant`, `lexical`,
-`ollama:<model>`, `anthropic[:model]`, `openai[:model]`.
-
-**Run `constant` first.** It always answers "hallucinated" and therefore scores
-**F1 = 0.667 at precision 0.500** on a balanced set, with no intelligence
-whatsoever. Compare that to the paper's Table 2, without knowledge:
-
-| Model (paper, no knowledge) | Overall F1 |
+| # | Problem in the official repo |
 |---|---|
-| *always-say-hallucinated baseline* | *0.667* |
-| GPT-4o | 0.737 |
-| Qwen2.5-14B-Instruct | 0.619 |
-| Llama-3.1-8B-Instruct | 0.522 |
-| Gemma-2-9b-Instruct | 0.515 |
-| OpenBioLLM-Llama3-8B | 0.484 |
-| Llama3-Med42-8B | 0.416 |
-
-Only GPT-4o clears the trivial baseline. **Every other model in the table scores
-below it**, several far below. That does not make the paper wrong — its finding
-is precisely that these models are bad at this task — but it does mean F1 alone
-flatters them, and it is why the paper also reports precision. Keep the constant
-row in any table you build; it is the number that makes the others interpretable.
-
-`--not-sure` adds the abstain option (Table 4). Watch precision rise while
-`resp%` falls — the model is buying accuracy with coverage, which in a clinical
-setting is often the right trade.
-
-### 3. `semantics.py` — the semantic claim (paper §5.3, Table 3)
+| 0 | `datasets` imported but never used; `torch` imported for GPU-only paths |
+| 1 | `from vllm import ...` at **module level** — won't import without CUDA |
+| 2 | OpenAI branch uses `openai.ChatCompletion.create`, removed in openai ≥1.0 |
+| 3 | Reply parser scores `"not sure"` as `"hallucinated"` (see findings) |
+| 4–7 | Adds CoT, RAG, the condition loop, and a config block |
 
 ```bash
-.venv/Scripts/python.exe src/semantics.py --config pqa_labeled
+python patch_original.py /path/to/MedHallu
 ```
 
-Paper §5.3 reports that **harder-to-detect hallucinations are semantically
-closer to the ground truth**. Testing it directly needs 50 candidate
-generations per question — GPU work. But difficulty *is* the discriminator vote
-count, so the claim is testable on the released rows: are `hard` hallucinations
-more similar to ground truth than `easy` ones?
+Backs up to `.py.orig`; `--revert` undoes it. Fails loudly if upstream text has
+changed rather than silently doing nothing.
 
-On all 10,000 released rows, **the effect runs the other way** — consistently,
-across all three measures, on both splits:
-
-| split | measure | easy | medium | hard | p (two-sided) |
-|---|---|---|---|---|---|
-| pqa_labeled (1k) | rouge1 | 0.335 | 0.332 | **0.298** | 1.5e-03 |
-| pqa_labeled | tfidf cosine | 0.400 | 0.379 | **0.332** | 5.2e-06 |
-| pqa_labeled | embedding cosine | 0.743 | 0.725 | **0.692** | 4.7e-05 |
-| pqa_artificial (9k) | rouge1 | 0.347 | 0.344 | **0.311** | 2.2e-23 |
-| pqa_artificial | tfidf cosine | 0.419 | 0.414 | **0.365** | 8.0e-28 |
-| pqa_artificial | embedding cosine | 0.742 | 0.738 | **0.701** | 8.2e-24 |
-
-The embedding row matters most: it closes off "this is only lexical overlap, not
-semantics". The reversal survives in embedding space. And the magnitudes line up
-with the paper — Table 3 reports cosine 0.715 (fooled) vs 0.696 (not fooled),
-which sits squarely inside the 0.69–0.74 range measured here. Comparable
-quantity, opposite direction with respect to the difficulty label.
-
-This is **not** a refutation, and the script says so when it prints. Two real
-differences:
-
-1. The paper compares *clusters* over 50 candidates per question; this compares
-   the single hallucination that was released.
-2. The generation pipeline's fallback rule (§3, Algorithm 1 Phase 2) selects,
-   among failed candidates, the one with **maximum cosine similarity to the
-   ground truth** — and labels it `easy`. So `easy` rows are enriched with
-   answers explicitly chosen for being close to the truth. That selection
-   effect pushes exactly the way the table shows.
-
-This is the most useful thing in the repo to sit with. The dataset's difficulty
-label is not a free-standing property of the text — it is partly an artifact of
-how the pipeline terminated. If you build on MedHallu, that is worth knowing
-before you treat `difficulty` as a measure of subtlety.
-
-### 4. `generate_demo.py` — the pipeline you cannot run (paper Figure 2)
+### B. This repo's own runner — faster to iterate on
 
 ```bash
-.venv/Scripts/python.exe src/generate_demo.py --dry-run --n 3
+python src/experiment.py --backend ollama:qwen2.5:7b-instruct --limit 200 --corpus textbooks
 ```
 
-Walks one question at a time through generate → quality vote → entailment check
-→ difficulty label. `--dry-run` needs no model and replays released rows.
-With `--backend ollama:...` it generates genuinely new hallucinated answers and
-runs a real judge vote — the honest small-scale version.
+Runs all five conditions and prints one table, sliced by difficulty and by
+hallucination type. Add `--diagnose` for the `oracle+rag` row.
 
-### 5. `rag.py` + `experiment.py` — RAG and CoT (Li et al.)
+**Not directly comparable to the paper** — it scores both answers per row,
+where the paper scores one at random.
 
-Built on *"Mitigating Hallucination in LLMs: An Application-Oriented Survey on
-RAG, Reasoning, and Agentic Systems"* (Li et al.), whose central claim is:
+**On backends:** `constant` and `lexical` are *not models*. They are plumbing
+tests — a constant classifier and a word-overlap heuristic — used to verify the
+code runs without a GPU. Ignore their numbers. `ollama:<model>` runs a real LLM
+locally and free; `anthropic` and `openai` need paid keys.
 
-> **RAG** fixes **knowledge-based** hallucinations (wrong or missing facts).
-> **CoT** fixes **logic-based** ones (sound facts, broken reasoning).
+---
 
-MedHallu's categories map onto that split — see `data.HALLUCINATION_TYPE`.
-**That mapping is ours, not the paper's, and it is arguable**: we call
-"Misinterpretation of #Question#" logic-based because the failure is answering a
-different question than the one asked. Expect to defend it.
+## Everything runs free on a laptop
 
-Retrieval quality first:
+No GPU required. Ollama serves an OpenAI-compatible endpoint on localhost, so
+the same code path reaches local models:
 
-```bash
-.venv/Scripts/python.exe src/rag.py --retriever dense --k 3 --corpus-extra pqa_artificial
+```python
+API_KEY = "ollama"
+BASE_URL = "http://localhost:11434/v1"
 ```
 
-On the 10,000-document corpus: TF-IDF gets recall@1 0.858 / recall@3 0.933;
-dense MiniLM gets **0.932 / 0.975**. **Always pass `--corpus-extra`** — without
-distractors retrieval is near-perfect, RAG collapses onto oracle, and the
-experiment measures nothing.
+Twelve of MedHallu's fourteen models fit in 16 GB at Q4 quantisation; only
+GPT-4o and GPT-4o-mini are API-only. **Speed, not memory, is the constraint** —
+budget ~25 s per judgement for a 7B model on CPU, so use 200–300 rows, not
+10,000.
 
-Then the 2×2:
+`STEP1_VALIDATE_BASELINE.md` lists all 14 models with their published scores and
+explains why the three we use were picked — by Δ-knowledge, not by F1.
 
-```bash
-.venv/Scripts/python.exe src/experiment.py --backend ollama:qwen2.5:1.5b-instruct --limit 300
-```
+---
 
-| | knowledge slice | logic slice |
-|---|---|---|
-| baseline | low | low |
-| + RAG | **HIGH** | low |
-| + CoT | low | **HIGH** |
-| + both | **HIGH** | **HIGH** |
+## Things we found along the way
 
-A clean diagonal supports the taxonomy. If RAG lifts both, or neither lifts its
-own slice, the taxonomy doesn't transfer to medical text — equally worth
-reporting, and nobody has checked.
+Four observations, each verified against the data or the code. Not the project's
+goal, but they affect how results should be read.
 
-`detect.py` also takes `--cot` and `--self-consistency N` (Wang et al. majority
-voting) individually.
+**1. A trivial baseline beats most of the paper's models.** MedHallu is
+balanced, so a classifier that always answers "hallucinated" scores **F1 =
+0.667** at precision 0.5. In Table 2 without knowledge, only GPT-4o (0.737)
+clears it — Llama-3.1-8B is 0.522, Med42-8B is 0.416. Thirteen of fourteen score
+below a constant. This does not contradict the paper, whose point is that models
+are bad at this, but F1 alone flatters them. `--backend constant` reproduces it;
+include that row in any table you make.
 
-**Two things that will bite you.** CoT replies are full of digits before the
-verdict ("step 1", "type 2 diabetes"), so the parser reads the `FINAL:` line or
-the *last* digit — taking the first, which is right for terse replies, mis-scores
-3 of 7 realistic CoT outputs. And the retrieval corpus is built from the full
-config, never the `--limit` sample; retrieving 300 questions from a 300-document
-corpus is trivially easy and inflates recall from 0.95 to 0.99.
+**2. A parsing bug in the official scoring code.** `calculate_metrics` tests
+`'not'` before `'not sure'`, so `"not sure"` is scored as `"hallucinated"` and
+the not-sure branch is unreachable. `'non'` catches `"non-hallucinated"` and
+inverts it. Of 13 realistic replies, 8 parse wrong. The patch fixes it. Impact
+on the published numbers is **unquantified** — most replies are bare digits —
+but Table 4's "not sure" rates are the most exposed.
 
-## Suggested order
+**3. The official script cannot read the official dataset.** It expects
+`question`, `ground_truth`, `least_similar_answer`; the HuggingFace release
+ships `Question`, `Ground Truth`, `Hallucinated Answer`, and a differently
+shaped `knowledge` field. The README says to load from HuggingFace; it would
+crash. `make_original_csv.py` converts it.
 
-1. `data.py` — see the data, confirm Figure 3.
-2. `generate_demo.py --dry-run` — understand where `difficulty` comes from.
-3. `detect.py --backend constant` — establish the floor.
-4. `detect.py --backend lexical --both` — a non-LLM attempt.
-5. `detect.py --backend ollama:... --limit 100 --both` — a real judge; expect
-   the knowledge gap the paper reports.
-6. `semantics.py` — the analysis, and the reversal.
-7. `rag.py` — check retrieval quality before trusting any RAG number.
-8. `experiment.py` — the RAG × CoT 2×2 against the taxonomy.
+**4. A claim in §5.3 reverses on the released data.** The paper reports that
+harder-to-detect hallucinations sit semantically *closer* to the ground truth.
+Measured across all 10,000 released rows by ROUGE-1, TF-IDF cosine and
+sentence-embedding cosine, the effect runs the other way — easy 0.742 vs hard
+0.701 embedding cosine, p ≈ 1e-23 on the 9k split.
 
-## What this is not
+This is **not** a refutation. The paper compares clusters over 50 candidate
+generations per question; we compare the single released answer. And the
+generation fallback (Algorithm 1, Phase 2) selects the candidate with *maximum*
+cosine similarity to ground truth and labels it `easy`, which biases exactly
+this way. The narrower takeaway: **`difficulty` is partly an artifact of how the
+generation loop terminated**, so be careful using it as a subtlety axis.
+`python src/semantics.py --embed` reproduces it.
 
-Not a reproduction. One judge over a few hundred samples is not 14 models over
-10,000, confidence intervals are not computed, and the dataset is consumed
-rather than rebuilt. It is a working scaffold for understanding the benchmark
-and for scoring any judge you can actually reach.
+---
 
-Original paper and dataset are the authors' work, MIT licensed.
+## Known limitations
+
+State these before anyone asks.
+
+- **Quantised, not fp16.** Q4 models are a different measurement from the paper's.
+- **Hundreds of rows, not 10,000.** Differences under ~0.05 F1 are noise.
+- **Textbooks, not PubMed.** The corpus may simply lack the specific finding.
+  Results bound what *textbook* retrieval can do, not retrieval in general.
+- **Two or three models, not fourteen.**
+- **The knowledge/logic taxonomy mapping is ours, not Li et al.'s.** Calling
+  "Misinterpretation of #Question#" logic-based is defensible but arguable, and
+  it is the hinge of the RAG-vs-CoT split. See `data.HALLUCINATION_TYPE`.
+- **Category sizes are very uneven.** 76% of MedHallu is one category; Evidence
+  Fabrication has 3 rows in the labeled split and 46 in the artificial one. Use
+  `pqa_artificial` for any per-category claim.
+- **The Ollama path is untested end to end.** The patch, the parser and the
+  retrieval are tested here; the API call itself was written against the current
+  SDK but not executed. Smoke-test with 20 rows first.
+
+---
+
+## Credits
+
+- **MedHallu** — Pandit et al., [arXiv:2502.14302](https://arxiv.org/abs/2502.14302).
+  Dataset and baselines. MIT licensed.
+- **Mitigating Hallucination in LLMs** — Li et al. RAG/CoT taxonomy and methods.
+- **MedRAG corpora** — Xiong et al., *Benchmarking RAG for Medicine*.
+- Source data: PubMedQA (`qiaojin/PubMedQA`).
