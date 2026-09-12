@@ -10,8 +10,13 @@ Three knowledge conditions, not the paper's two:
   none     the judge sees only the question and answer
   oracle   the judge gets the exact PubMed context the question came from.
            This is the paper's "with knowledge" setting -- perfect retrieval.
-  rag      the judge gets the top-k passages an actual retriever fetched.
-           See rag.py; this is the realistic middle case the paper skips.
+  rag      the judge gets the top-k passages an actual retriever fetched from
+           an EXTERNAL corpus (medical textbooks). See rag.py.
+  oracle+rag
+           both: the correct passage AND the retrieved ones. Isolates the cost
+           of distractors from the cost of missing the passage --
+             oracle - (oracle+rag) = what the noise alone costs
+             (oracle+rag) - rag    = what missing the passage costs
 
 The paper measures none (~0.53) and oracle (~0.78) and leaves the gap between
 them unexplored. Running all three tells you how much of that +0.25 survives
@@ -36,7 +41,7 @@ import data
 from backends import get_backend
 from config import CONFIGS, RESULTS_DIR
 
-MODES = ("none", "oracle", "rag")
+MODES = ("none", "oracle", "rag", "oracle+rag")
 
 
 def score(preds, labels, allow_not_sure):
@@ -122,29 +127,38 @@ def attach_rag(df, pairs, args, full_df=None):
     import rag  # imported lazily so non-RAG runs need no retrieval deps
 
     full = df if full_df is None else full_df
-    corpus = rag.build_corpus(full)
-    n_gold = len(corpus)
-    if args.corpus_extra:
-        extra = rag.build_corpus(data.load(args.corpus_extra))
-        corpus = corpus + extra
-        print(f"rag corpus: {n_gold} gold + {len(extra)} distractors = {len(corpus)}")
-    else:
-        print(f"rag corpus: {len(corpus)} documents "
-              "(no distractors -- retrieval will be near-perfect; "
-              "use --corpus-extra for a realistic test)")
+    corpus = rag.get_corpus(args.corpus, full, args.max_docs)
+    print(f"rag corpus: {args.corpus} ({len(corpus):,} passages)")
+    if args.corpus == "self":
+        print("  ! 'self' searches MedHallu's own Knowledge fields.")
+        print("    The correct passage is present by construction, so this is")
+        print("    an ablation, not a RAG result.")
 
     retriever = rag.get_retriever(args.retriever, corpus)
     passages, ranked = rag.retrieve_knowledge(df, retriever, args.k, corpus)
 
-    # Where each sampled question's own passage sits in the full corpus.
-    gold = df["orig_index"].to_numpy() if "orig_index" in df.columns else None
-    recall = rag.recall_at_k(ranked, args.k, gold)
-    print(f"rag retriever: {retriever.name}   k={args.k}   recall@{args.k}={recall:.3f}")
+    # recall@k is only defined for the 'self' ablation, where the gold passage
+    # is in the corpus. An external corpus has no labelled gold document.
+    recall = None
+    if args.corpus == "self":
+        gold = df["orig_index"].to_numpy() if "orig_index" in df.columns else None
+        recall = rag.recall_at_k(ranked, args.k, gold)
+        print(f"rag retriever: {retriever.name}   k={args.k}   recall@{args.k}={recall:.3f}")
+    else:
+        print(f"rag retriever: {retriever.name}   k={args.k}")
 
     # pairs carry source_row, so the same retrieval serves both of a row's
     # examples without retrieving twice.
     by_row = dict(enumerate(passages))
     pairs["knowledge_rag"] = pairs["source_row"].map(by_row)
+
+    # Oracle first, then the retrieved passages. Position matters -- models read
+    # the head of a context best -- so putting oracle first is the GENEROUS
+    # arrangement. If it still loses to plain oracle, distractors are doing real
+    # damage; shuffle the order for a harsher test.
+    separator = "\n\n"
+    pairs["knowledge_oracle_rag"] = (
+        pairs["knowledge"].astype(str) + separator + pairs["knowledge_rag"].astype(str))
     return recall
 
 
@@ -167,8 +181,10 @@ def main():
                          "meaningful, and costs N forward passes per judgement")
     ap.add_argument("--retriever", default="tfidf", help="rag only: tfidf | dense[:model]")
     ap.add_argument("--k", type=int, default=3, help="rag only: passages to retrieve")
-    ap.add_argument("--corpus-extra", default=None,
-                    help="rag only: another config to add as distractors, e.g. pqa_artificial")
+    ap.add_argument("--corpus", default="textbooks",
+                    help="rag only: textbooks | statpearls | pubmed | wikipedia | self")
+    ap.add_argument("--max-docs", type=int, default=0,
+                    help="rag only: cap the corpus size for a quick run")
     args = ap.parse_args()
 
     modes = [m.strip() for m in args.knowledge_mode.split(",") if m.strip()]
@@ -194,10 +210,11 @@ def main():
     print(f"data    : {args.config}, {len(df)} rows -> {len(pairs)} judgements per pass")
 
     recall = None
-    if "rag" in modes:
+    if {"rag", "oracle+rag"} & set(modes):
         recall = attach_rag(df, pairs, args, full_df)
 
-    column = {"none": None, "oracle": "knowledge", "rag": "knowledge_rag"}
+    column = {"none": None, "oracle": "knowledge", "rag": "knowledge_rag",
+              "oracle+rag": "knowledge_oracle_rag"}
     results = {}
     for mode in modes:
         started = time.time()
@@ -217,6 +234,17 @@ def main():
             f1 = results[mode]["overall"]["f1"]
             delta = f"{f1 - base:+.3f}" if base is not None and mode != "none" else ""
             print(f"  {mode:<10}{f1:>8}{delta:>10}")
+        if {"oracle", "rag", "oracle+rag"} <= set(modes) and base is not None:
+            o = results["oracle"]["overall"]["f1"]
+            orag = results["oracle+rag"]["overall"]["f1"]
+            r = results["rag"]["overall"]["f1"]
+            print()
+            print("  decomposing why rag trails oracle:")
+            print(f"    cost of distractors      {orag - o:+.3f}   "
+                  "(oracle+rag vs oracle)")
+            print(f"    cost of missing passage  {r - orag:+.3f}   "
+                  "(rag vs oracle+rag)")
+
         if {"oracle", "rag"} <= set(modes) and base is not None:
             kept = results["rag"]["overall"]["f1"] - base
             total = results["oracle"]["overall"]["f1"] - base
@@ -239,9 +267,9 @@ def main():
                "not_sure": args.not_sure, "cot": args.cot,
                "self_consistency": args.self_consistency,
                "modes": modes, "results": results}
-    if recall is not None:
+    if "rag" in modes:
         payload["rag"] = {"retriever": args.retriever, "k": args.k,
-                          "corpus_extra": args.corpus_extra, "recall_at_k": recall}
+                      "corpus": args.corpus, "recall_at_k": recall}
     summary.write_text(json.dumps(payload, indent=2))
     print(f"\nsaved -> {summary}")
 

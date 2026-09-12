@@ -100,13 +100,22 @@ names differ. This converts it:
 python src/make_original_csv.py --config pqa_labeled
 ```
 
-For a realistic RAG corpus, also build the 9k split and point `RAG_CORPUS_CSV`
-at it. **Without distractors, retrieval is near-perfect and RAG collapses onto
-oracle** — the experiment then measures nothing.
+### RAG needs an EXTERNAL knowledge source
+
+RAG must search a corpus the benchmark knows nothing about. Searching
+MedHallu's own `Knowledge` fields is not RAG — the correct passage would be
+present by construction, and you would only be measuring ranking.
+
+We use **MedRAG/textbooks**: 125,847 snippets from 18 medical textbooks, ~101 MB,
+ungated. Downloaded and cached automatically on first use:
 
 ```bash
-python src/make_original_csv.py --config pqa_artificial -o corpus_9k.csv
+python src/rag.py --corpus textbooks --k 3 --limit 5
 ```
+
+This is a genuinely hard test. MedHallu questions come from PubMed research
+abstracts; medical textbooks may not contain the specific finding at all. That
+is the realistic case, and it is why RAG will not reach oracle.
 
 ### 5. Configure
 
@@ -116,7 +125,7 @@ Edit the `CONFIGURATION` block at the top of the patched script:
 DF_PATH = "medhallu.csv"
 CSV_PATH = "results.csv"
 LIMIT = 200                        # not 10,000 -- that is days on a CPU
-RAG_CORPUS_CSV = "corpus_9k.csv"
+# RAG corpus: MedRAG/textbooks, downloaded automatically
 ```
 
 and set the models list:
@@ -183,8 +192,9 @@ State these before anyone asks:
 
 - **Q4 quantisation, not fp16.** Different measurement from the paper's.
 - **200 rows, not 10,000.** Differences under ~0.05 F1 are noise.
-- **RAG retrieves from a closed corpus** where the right passage is guaranteed
-  present. Real PubMed is 35M abstracts. These are upper bounds.
+- **RAG retrieves from medical textbooks**, not PubMed. The specific finding a
+  research abstract reports may not be in any textbook, so expect RAG to fall
+  well short of oracle. That gap is the result, not a bug.
 - **One judge model at a time**, not the paper's 14.
 
 None of these invalidate the comparison. They bound what it can claim.

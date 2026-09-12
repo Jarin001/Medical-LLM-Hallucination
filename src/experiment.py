@@ -59,9 +59,10 @@ def main():
     ap.add_argument("--self-consistency", type=int, default=0, metavar="N")
     ap.add_argument("--retriever", default="dense")
     ap.add_argument("--k", type=int, default=3)
-    ap.add_argument("--corpus-extra", default="pqa_labeled",
-                    help="distractor pool; without it retrieval is near-perfect "
-                         "and rag collapses onto oracle")
+    ap.add_argument("--corpus", default="textbooks",
+                    help="external knowledge source: textbooks | statpearls | "
+                         "pubmed | wikipedia, or 'self' for the ablation")
+    ap.add_argument("--max-docs", type=int, default=0)
     args = ap.parse_args()
 
     full_df = data.load(args.config)
@@ -85,7 +86,8 @@ def main():
 
     detect.attach_rag(df, pairs, args, full_df)
 
-    column = {"none": None, "oracle": "knowledge", "rag": "knowledge_rag"}
+    column = {"none": None, "oracle": "knowledge", "rag": "knowledge_rag",
+              "oracle+rag": "knowledge_oracle_rag"}
     results = {}
     for label, mode, cot in CONDITIONS:
         started = time.time()

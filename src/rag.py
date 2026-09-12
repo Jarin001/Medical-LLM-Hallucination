@@ -1,49 +1,45 @@
-"""Retrieval layer, so detection can use *retrieved* knowledge instead of oracle.
+"""Retrieval over an EXTERNAL medical knowledge source.
 
-Why this is worth doing
------------------------
-MedHallu's "with knowledge" setting hands the judge the exact PubMed context the
-question was written from. That is **oracle retrieval** -- perfect recall, zero
-noise. It is also the paper's largest single effect: about +0.25 F1 averaged
-over general models.
+What RAG has to mean here
+-------------------------
+MedHallu ships a `Knowledge` field per row: the exact PubMed abstract the
+question was written from. Handing that to the judge is the paper's "with
+knowledge" setting -- call it ORACLE. Perfect retrieval, guaranteed correct,
+zero noise. No deployed system has it.
 
-So the paper measures two points:
+An earlier version of this module retrieved from those same Knowledge fields.
+That was wrong. Searching the benchmark's own answer key is not retrieval-
+augmented generation; the correct passage is present by construction, so the
+task is only ever "rank it first". It measures ranking, not knowledge access.
 
-    no knowledge          F1 ~ 0.53     (paper avg, general LLMs)
-    oracle knowledge      F1 ~ 0.78
+Real RAG searches a corpus the benchmark knows nothing about, where the needed
+fact may simply not be there. That is the hard part, and it is what this module
+now does.
 
-and leaves the interesting one unmeasured:
+Corpora
+-------
+From MedRAG (Xiong et al., Benchmarking RAG for Medicine). All ungated.
 
-    RETRIEVED knowledge   F1 = ?        <- this module
+  textbooks    125,847 snippets from 18 medical textbooks.  ~101 MB.  DEFAULT.
+  statpearls    9,330 clinical reference articles.          small.
+  pubmed       23.9M abstract snippets.                     tens of GB -- needs
+                                                            a real machine.
+  wikipedia    general encyclopaedia.                       large.
 
-A real deployment never has oracle context. It retrieves, imperfectly. Where the
-retrieved number lands in that 0.25-wide gap tells you how much of the paper's
-headline gain survives contact with a real pipeline. That is a genuine question
-the paper does not answer.
+Textbooks is the default because it fits a laptop and is a genuinely different
+source from MedHallu's PubMed-derived questions. A medical textbook may or may
+not contain the specific finding a 2012 retrospective laparotomy study reports
+-- and that uncertainty is the realistic case.
 
-The setup here also lets you separate the two failure modes, which the oracle
-setting conflates:
-
-    retrieval failure   the right passage was never fetched
-    reasoning failure   it was fetched and the model still got it wrong
-
-Corpus
-------
-One document per source row, built from that row's `Knowledge` field. So for
-question i, document i is by construction the correct one -- which makes
-recall@k directly measurable.
-
-Be honest about what that means: this is a **closed corpus** where the answer is
-guaranteed present. It is the optimistic case. A realistic setup retrieves from
-all of PubMed, where the right passage may be absent entirely. Treat the numbers
-here as an upper bound on what retrieval contributes; see `--corpus-extra` to
-dilute the corpus with distractors and get closer to reality.
+  self         MedHallu's own Knowledge fields. Kept ONLY as an ablation, to
+               show the gap between real retrieval and searching the answer
+               key. Do not report this as RAG.
 
 Usage
 -----
-  python src/rag.py --retriever tfidf --k 3
-  python src/rag.py --retriever dense --k 3        # needs sentence-transformers
-  python src/rag.py --retriever dense --k 5 --config pqa_artificial
+  python src/rag.py --corpus textbooks --k 3
+  python src/rag.py --corpus textbooks --k 5 --retriever dense
+  python src/rag.py --corpus self --k 3        # ablation, not a RAG result
 """
 import argparse
 import pickle
@@ -53,19 +49,78 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 import data
-from config import CACHE_DIR, COL_KNOWLEDGE, COL_QUESTION, RESULTS_DIR
+from config import CACHE_DIR, COL_KNOWLEDGE, COL_QUESTION, DATA_DIR, RESULTS_DIR
 
 
 # --------------------------------------------------------------------------
 # Corpus
 # --------------------------------------------------------------------------
-def build_corpus(df: pd.DataFrame) -> list[str]:
-    """One document per row: that row's knowledge passages joined.
+EXTERNAL_CORPORA = {
+    "textbooks": "MedRAG/textbooks",
+    "statpearls": "MedRAG/statpearls",
+    "pubmed": "MedRAG/pubmed",
+    "wikipedia": "MedRAG/wikipedia",
+}
 
-    Document i belongs to question i. That alignment is what makes recall@k
-    computable without any extra annotation.
+
+def load_external_corpus(name: str, max_docs: int = 0) -> list[str]:
+    """Download and cache a MedRAG corpus. Returns a list of passages.
+
+    Cached as parquet after the first run, so the 101 MB textbooks download
+    happens once.
+    """
+    import io
+    import requests
+
+    if name not in EXTERNAL_CORPORA:
+        raise SystemExit(f"unknown corpus {name!r}; choose from "
+                         f"{list(EXTERNAL_CORPORA)} or 'self'")
+    repo = EXTERNAL_CORPORA[name]
+    local = DATA_DIR / f"corpus_{name}.parquet"
+
+    if local.exists():
+        frame = pd.read_parquet(local)
+    else:
+        print(f"downloading {repo} (first run only)...")
+        index = requests.get(
+            f"https://huggingface.co/api/datasets/{repo}/parquet", timeout=120).json()
+        config = list(index)[0]
+        files = index[config].get("train") or list(index[config].values())[0]
+        frames = []
+        for i, url in enumerate(files, 1):
+            print(f"  shard {i}/{len(files)}")
+            resp = requests.get(url, timeout=1800)
+            resp.raise_for_status()
+            frames.append(pd.read_parquet(io.BytesIO(resp.content)))
+        frame = pd.concat(frames, ignore_index=True)
+        frame.to_parquet(local, index=False)
+        print(f"  cached -> {local}")
+
+    # MedRAG uses `contents` (title prefixed) where available; it retrieves
+    # better than the bare body because the book name carries topic signal.
+    column = "contents" if "contents" in frame.columns else "content"
+    passages = frame[column].astype(str).tolist()
+    if max_docs:
+        passages = passages[:max_docs]
+    return passages
+
+
+def build_self_corpus(df: pd.DataFrame) -> list[str]:
+    """MedHallu's own Knowledge fields. ABLATION ONLY.
+
+    Retrieving from here means the correct passage is always present, so
+    results are an upper bound that no real system reaches. Useful to quantify
+    how much easier that makes the task; not a RAG result.
     """
     return [data._flatten_knowledge(v) for v in df[COL_KNOWLEDGE]]
+
+
+def get_corpus(name: str, df: pd.DataFrame | None = None, max_docs: int = 0) -> list[str]:
+    if name == "self":
+        if df is None:
+            raise SystemExit("corpus 'self' needs the dataframe")
+        return build_self_corpus(df)
+    return load_external_corpus(name, max_docs)
 
 
 # --------------------------------------------------------------------------
@@ -177,50 +232,56 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="pqa_labeled")
+    ap.add_argument("--corpus", default="textbooks",
+                    help="textbooks | statpearls | pubmed | wikipedia | self")
     ap.add_argument("--retriever", default="tfidf", help="tfidf | dense[:model]")
     ap.add_argument("--k", type=int, default=3)
-    ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--corpus-extra", default=None,
-                    help="add another config's passages as distractors, e.g. pqa_artificial")
+    ap.add_argument("--limit", type=int, default=20, help="questions to show")
+    ap.add_argument("--max-docs", type=int, default=0, help="cap corpus size")
     args = ap.parse_args()
 
-    df = data.load(args.config)
-    if args.limit:
-        df = df.head(args.limit)
-    df = df.reset_index(drop=True)
-
-    corpus = build_corpus(df)
-    n_gold = len(corpus)
-    if args.corpus_extra:
-        extra = build_corpus(data.load(args.corpus_extra))
-        corpus = corpus + extra
-        print(f"corpus: {n_gold} gold + {len(extra)} distractors = {len(corpus)}")
-    else:
-        print(f"corpus: {len(corpus)} documents (no distractors)")
+    df = data.load(args.config).head(args.limit).reset_index(drop=True)
+    corpus = get_corpus(args.corpus, df, args.max_docs)
+    print(f"corpus    : {args.corpus}  ({len(corpus):,} passages)")
 
     retriever = get_retriever(args.retriever, corpus)
-    ranked = retriever.search(list(df[COL_QUESTION].astype(str)), max(args.k, 10))
+    passages, ranked = retrieve_knowledge(df, retriever, args.k, corpus)
+    print(f"retriever : {retriever.name}   k={args.k}   queries={len(df)}")
 
-    print(f"\nretriever: {retriever.name}   queries: {len(df)}")
-    print(f"\n  {'metric':<12}{'value':>8}")
-    print("  " + "-" * 20)
-    for kk in (1, 3, 5, 10):
-        print(f"  recall@{kk:<5}{recall_at_k(ranked, kk):>8.3f}")
-    print(f"  {'MRR':<12}{mrr(ranked):>8.3f}")
+    if args.corpus == "self":
+        print()
+        print(f"recall@{args.k}: {recall_at_k(ranked, args.k):.3f}   "
+              f"MRR: {mrr(ranked):.3f}")
+        print("(only computable because the gold passage IS the corpus --")
+        print(" this is the ablation, not a RAG result)")
+    else:
+        print()
+        print("No recall@k: an external corpus has no labelled gold passage for")
+        print("these questions. That is the point -- judge the retrieval by")
+        print("whether detection F1 improves, not by rank.")
 
-    out = RESULTS_DIR / f"retrieval_{args.retriever.replace(':', '-')}_{args.config}.csv"
-    pd.DataFrame({
-        "question": df[COL_QUESTION],
-        "gold_doc": np.arange(len(df)),
-        "top1": ranked[:, 0],
-        "hit@1": ranked[:, 0] == np.arange(len(df)),
-        "hit@k": (ranked[:, :args.k] == np.arange(len(df))[:, None]).any(axis=1),
-    }).to_csv(out, index=False)
-    print(f"\nsaved -> {out}")
+    print()
+    print("=" * 78)
+    print("What got retrieved for the first question")
+    print("=" * 78)
+    row = df.iloc[0]
+    print()
+    print("QUESTION")
+    print(" ", str(row[COL_QUESTION])[:300])
+    print()
+    print("ORACLE -- what MedHallu ships, for comparison")
+    print(" ", data._flatten_knowledge(row[COL_KNOWLEDGE])[:300], "...")
+    print()
+    print(f"RETRIEVED from {args.corpus}:")
+    for rank, j in enumerate(ranked[0], 1):
+        print()
+        print(f"  [{rank}]", corpus[j][:280], "...")
 
-    print("\nNext: feed these to the judge instead of the oracle context --")
-    print(f"  python src/detect.py --backend <b> --knowledge-mode rag "
-          f"--retriever {args.retriever} --k {args.k}")
+    out = RESULTS_DIR / f"retrieval_{args.corpus}_{args.retriever.replace(':', '-')}.csv"
+    pd.DataFrame({"question": df[COL_QUESTION],
+                  "retrieved": passages}).to_csv(out, index=False)
+    print()
+    print(f"saved -> {out}")
 
 
 if __name__ == "__main__":
